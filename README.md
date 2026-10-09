@@ -28,12 +28,6 @@
 
 *При включении зажатия звучит высокий звуковой сигнал (бип), при выключении — низкий.*
 
----
-
-## 🚀 Запуск программы
-
-1. Перейдите в папку: `C:\Users\mochalka\.gemini\antigravity\scratch\window_mouse_lock`
-2. Запустите [run.bat](file:///C:/Users/mochalka/.gemini/antigravity/scratch/window_mouse_lock/run.bat) или [Запустить.bat](file:///C:/Users/mochalka/.gemini/antigravity/scratch/window_mouse_lock/%D0%97%D0%B0%D0%BF%D1%83%D1%81%D1%82%D0%B8%D1%82%D1%8C.bat).
 
 ---
 
