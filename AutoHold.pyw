@@ -2,7 +2,8 @@
 AutoHold Pro - Надежное зажатие клавиш мыши (Alt + ЛКМ / Alt + ПКМ, F6, F7, F8)
 Разработано для фиксации зажатия клавиши на выбранном окне (игры, Minecraft OneBlock, программы).
 
-Поддерживает запуск как с консолью, так и без консоли (pythonw / .pyw).
+Поддерживает запуск как с консолью, так и без консоли (pythonw / .pyw / .exe).
+Безупречное распознавание Alt с защитой от сброса Windows и синтетических событий.
 """
 
 import sys
@@ -204,9 +205,13 @@ class AutoHoldApp:
         self.physical_lmb_down = False
         self.physical_rmb_down = False
 
+        # Отслеживание Alt с защитой от сброса Windows при клике
         self.alt_is_down = False
-        self.last_lmb_toggle = 0
-        self.last_rmb_toggle = 0
+        self.last_alt_press_time = 0.0
+        self.last_alt_release_time = 0.0
+
+        self.last_lmb_toggle = 0.0
+        self.last_rmb_toggle = 0.0
         self.is_picking = False
         self.lock = threading.Lock()
         self.worker_thread = None
@@ -257,17 +262,35 @@ class AutoHoldApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def is_alt_pressed_now(self):
-        """Многоуровневая проверка зажатия клавиши Alt"""
-        return bool(
-            self.alt_is_down or
-            (user32.GetAsyncKeyState(VK_MENU) & 0x8000) or
-            (user32.GetAsyncKeyState(VK_LMENU) & 0x8000) or
-            (user32.GetAsyncKeyState(VK_RMENU) & 0x8000)
-        )
+        """
+        Многоуровневая проверка зажатия клавиши Alt с защитой от синтетического сброса Windows.
+        Windows при щелчке мыши с Alt часто сбрасывает флаг меню, посылая fake keyup.
+        """
+        now = time.time()
+        # 1. Флаг зажатия от слушателя
+        if self.alt_is_down:
+            return True
+        # 2. Недавнее нажатие/отпускание Alt (окно 400 мс)
+        if (now - self.last_alt_release_time < 0.40) or (now - self.last_alt_press_time < 0.70 and self.last_alt_press_time > 0):
+            return True
+        # 3. Аппаратный опрос драйвера
+        if bool((user32.GetAsyncKeyState(VK_MENU) & 0x8000) or
+                (user32.GetAsyncKeyState(VK_LMENU) & 0x8000) or
+                (user32.GetAsyncKeyState(VK_RMENU) & 0x8000) or
+                (user32.GetKeyState(VK_MENU) & 0x8000)):
+            return True
+        return False
 
     def on_kb_press(self, key):
         if is_alt_key_object(key):
             self.alt_is_down = True
+            self.last_alt_press_time = time.time()
+            # Если пользователь зажал кнопку мыши ДО того, как нажал Alt:
+            if bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
+                self.root.after(0, self.toggle_lmb)
+            elif bool(user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000):
+                self.root.after(0, self.toggle_rmb)
+
         elif key == pynput_kb.Key.f6:
             self.root.after(0, self.toggle_lmb)
         elif key == pynput_kb.Key.f7:
@@ -281,6 +304,7 @@ class AutoHoldApp:
     def on_kb_release(self, key):
         if is_alt_key_object(key):
             self.alt_is_down = False
+            self.last_alt_release_time = time.time()
 
     def on_mouse_click(self, x, y, button, pressed):
         if not pressed:
