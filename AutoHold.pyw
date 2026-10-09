@@ -194,7 +194,7 @@ class AutoHoldApp:
         self.last_rmb_toggle = 0.0
         self.last_synthetic_time = 0.0
         self.is_picking = False
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.worker_thread = None
         self.worker_running = False
 
@@ -666,7 +666,9 @@ class AutoHoldApp:
             currently_held = self.lmb_held
 
         if currently_held:
-            self.toggle_lmb()
+            # Прямое, гарантированное мгновенное отключение
+            self._stop_lmb()
+            self.update_ui_state()
         else:
             if not self.target_window_data:
                 messagebox.showwarning(
@@ -681,8 +683,9 @@ class AutoHoldApp:
 
     def _start_lmb_from_gui(self):
         with self.lock:
-            if not self.lmb_held:
-                self._start_lmb()
+            already_held = self.lmb_held
+        if not already_held:
+            self._start_lmb()
         self.update_ui_state()
 
     def btn_toggle_rmb_click(self):
@@ -690,7 +693,9 @@ class AutoHoldApp:
             currently_held = self.rmb_held
 
         if currently_held:
-            self.toggle_rmb()
+            # Прямое, гарантированное мгновенное отключение
+            self._stop_rmb()
+            self.update_ui_state()
         else:
             if not self.target_window_data:
                 messagebox.showwarning(
@@ -705,39 +710,44 @@ class AutoHoldApp:
 
     def _start_rmb_from_gui(self):
         with self.lock:
-            if not self.rmb_held:
-                self._start_rmb()
+            already_held = self.rmb_held
+        if not already_held:
+            self._start_rmb()
         self.update_ui_state()
 
-    # --- Управление зажатием (Хоткеи и логика) ---
+    # --- Управление зажатием (Хоткеи и общая логика) ---
     def toggle_lmb(self):
         now = time.time()
-        if now - self.last_lmb_toggle < 0.30:
+        if now - self.last_lmb_toggle < 0.25:
             return
         self.last_lmb_toggle = now
 
         self.check_and_update_foreground_target()
 
         with self.lock:
-            if self.lmb_held:
-                self._stop_lmb()
-            else:
-                self._start_lmb()
+            currently_held = self.lmb_held
+
+        if currently_held:
+            self._stop_lmb()
+        else:
+            self._start_lmb()
         self.update_ui_state()
 
     def toggle_rmb(self):
         now = time.time()
-        if now - self.last_rmb_toggle < 0.30:
+        if now - self.last_rmb_toggle < 0.25:
             return
         self.last_rmb_toggle = now
 
         self.check_and_update_foreground_target()
 
         with self.lock:
-            if self.rmb_held:
-                self._stop_rmb()
-            else:
-                self._start_rmb()
+            currently_held = self.rmb_held
+
+        if currently_held:
+            self._stop_rmb()
+        else:
+            self._start_rmb()
         self.update_ui_state()
 
     def _start_lmb(self):
@@ -745,9 +755,10 @@ class AutoHoldApp:
             self.log("⚠️ Не выбрано целевое окно!")
             return
 
-        self.lmb_held = True
-        if not self.rmb_held:
-            self.hold_start_time = time.time()
+        with self.lock:
+            self.lmb_held = True
+            if not self.rmb_held:
+                self.hold_start_time = time.time()
 
         self.play_sound(on=True)
         self.log(f"🟢 ЗАЖАТА ЛКМ на окне: {self.target_window_data['display']}")
@@ -756,9 +767,7 @@ class AutoHoldApp:
         self.ensure_worker_running()
 
     def _activate_lmb_hold(self):
-        """
-        Ждем отпускания физической кнопки пользователем, затем активируем зажим.
-        """
+        """Ждем отпускания физической кнопки пользователем, затем активируем аппаратный зажим"""
         while bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000) and self.lmb_held:
             time.sleep(0.01)
         time.sleep(0.03)
@@ -770,12 +779,15 @@ class AutoHoldApp:
                 self.press_hardware_lmb()
 
     def _stop_lmb(self):
-        if not self.lmb_held:
-            return
-        self.lmb_held = False
+        with self.lock:
+            if not self.lmb_held:
+                return
+            self.lmb_held = False
+
         self.play_sound(on=False)
         self.log("⚪ Отпущена ЛКМ")
 
+        # Безусловное освобождение физической мыши и оконных сообщений
         self.release_hardware_lmb()
         self.send_postmessage_up("LMB")
 
@@ -787,9 +799,10 @@ class AutoHoldApp:
             self.log("⚠️ Не выбрано целевое окно!")
             return
 
-        self.rmb_held = True
-        if not self.lmb_held:
-            self.hold_start_time = time.time()
+        with self.lock:
+            self.rmb_held = True
+            if not self.lmb_held:
+                self.hold_start_time = time.time()
 
         self.play_sound(on=True)
         self.log(f"🟣 ЗАЖАТА ПКМ на окне: {self.target_window_data['display']}")
@@ -809,9 +822,11 @@ class AutoHoldApp:
                 self.press_hardware_rmb()
 
     def _stop_rmb(self):
-        if not self.rmb_held:
-            return
-        self.rmb_held = False
+        with self.lock:
+            if not self.rmb_held:
+                return
+            self.rmb_held = False
+
         self.play_sound(on=False)
         self.log("⚪ Отпущена ПКМ")
 
@@ -835,20 +850,18 @@ class AutoHoldApp:
 
             if was_active:
                 self.play_sound(on=False)
-                self.log("🛑 ВСЕ ЗАЖАТИЯ ОСТАНОВЛЕНЫ (Esc)")
+                self.log("🛑 ВСЕ ЗАЖАТИЯ ОСТАНОВЛЕНЫ")
         self.update_ui_state()
 
     def release_hardware_lmb(self):
-        if self.physical_lmb_down:
-            self.last_synthetic_time = time.time()
-            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-            self.physical_lmb_down = False
+        self.last_synthetic_time = time.time()
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        self.physical_lmb_down = False
 
     def release_hardware_rmb(self):
-        if self.physical_rmb_down:
-            self.last_synthetic_time = time.time()
-            user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-            self.physical_rmb_down = False
+        self.last_synthetic_time = time.time()
+        user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+        self.physical_rmb_down = False
 
     def press_hardware_lmb(self):
         self.last_synthetic_time = time.time()
@@ -1001,6 +1014,8 @@ class AutoHoldApp:
 
         self.release_hardware_lmb()
         self.release_hardware_rmb()
+        self.send_postmessage_up("LMB")
+        self.send_postmessage_up("RMB")
         self.worker_running = False
 
     def update_ui_state(self):
