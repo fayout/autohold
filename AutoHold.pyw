@@ -1,15 +1,15 @@
 """
-AutoHold Pro - Надежное зажатие клавиш мыши (Alt + ЛКМ / Alt + ПКМ, F6, F7, F8)
+AutoHold Pro - Надежное зажатие клавиш мыши (Левый Alt + ЛКМ / Левый Alt + ПКМ)
 Разработано для фиксации зажатия клавиши на выбранном окне (игры, Minecraft OneBlock, программы).
 
 Поддерживает запуск как с консолью, так и без консоли (pythonw / .pyw / .exe).
-Безупречное распознавание Alt с защитой от сброса Windows и синтетических событий.
+100% чистый Win32 API через ctypes (без сторонних хуков pynput), мгновенный отклик и надежность.
 """
 
 import sys
 import os
 
-# Безопасная работа с pythonw (без консоли: sys.stdout и sys.stderr равны None)
+# Безопасная работа без консоли (sys.stdout и sys.stderr равны None в pythonw / pyinstaller --noconsole)
 if sys.stdout is None:
     try:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
@@ -33,7 +33,6 @@ from ctypes import wintypes
 import tkinter as tk
 from tkinter import ttk, messagebox
 import winsound
-from pynput import mouse, keyboard as pynput_kb
 
 # Включение High-DPI
 try:
@@ -57,32 +56,18 @@ WM_MOUSEMOVE   = 0x0200
 MK_LBUTTON     = 0x0001
 MK_RBUTTON     = 0x0002
 
-VK_MENU        = 0x12  # Alt
+VK_MENU        = 0x12  # Alt (любой)
 VK_LMENU       = 0xA4  # Левый Alt
 VK_RMENU       = 0xA5  # Правый Alt
-VK_LBUTTON     = 0x01
-VK_RBUTTON     = 0x02
-VK_F6          = 0x75  # F6
-VK_F7          = 0x76  # F7
-VK_F8          = 0x77  # F8
+VK_LBUTTON     = 0x01  # ЛКМ
+VK_RBUTTON     = 0x02  # ПКМ
+VK_ESCAPE      = 0x1B  # Esc
 GA_ROOT        = 2
 
 MOUSEEVENTF_LEFTDOWN   = 0x0002
 MOUSEEVENTF_LEFTUP     = 0x0004
 MOUSEEVENTF_RIGHTDOWN  = 0x0008
 MOUSEEVENTF_RIGHTUP    = 0x0010
-
-
-def is_alt_key_object(key):
-    """Универсальная проверка, является ли объект клавиши pynput клавишей Alt (для любых раскладок)"""
-    if key in (pynput_kb.Key.alt, pynput_kb.Key.alt_l, pynput_kb.Key.alt_r, pynput_kb.Key.alt_gr):
-        return True
-    vk = getattr(key, 'vk', None)
-    if vk in (18, 164, 165):
-        return True
-    if 'alt' in str(key).lower():
-        return True
-    return False
 
 
 def get_process_name_by_hwnd(hwnd):
@@ -205,11 +190,6 @@ class AutoHoldApp:
         self.physical_lmb_down = False
         self.physical_rmb_down = False
 
-        # Отслеживание Alt с защитой от сброса Windows при клике
-        self.alt_is_down = False
-        self.last_alt_press_time = 0.0
-        self.last_alt_release_time = 0.0
-
         self.last_lmb_toggle = 0.0
         self.last_rmb_toggle = 0.0
         self.is_picking = False
@@ -236,21 +216,10 @@ class AutoHoldApp:
         self.setup_styles()
         self.build_ui()
 
-        # 1. Запуск слушателя клавиатуры (pynput)
-        self.kb_listener = pynput_kb.Listener(
-            on_press=self.on_kb_press,
-            on_release=self.on_kb_release
-        )
-        self.kb_listener.start()
-
-        # 2. Запуск слушателя мыши (pynput)
-        self.mouse_listener = mouse.Listener(on_click=self.on_mouse_click)
-        self.mouse_listener.start()
-
-        # 3. Дополнительный аппаратный опросник для 100% надежности
-        self.hotkey_poller_running = True
-        self.hotkey_poller_thread = threading.Thread(target=self._hotkey_poller_loop, daemon=True)
-        self.hotkey_poller_thread.start()
+        # Аппаратный Win32 опросчик хоткеев (Alt + ЛКМ / ПКМ, Esc)
+        self.poller_running = True
+        self.poller_thread = threading.Thread(target=self._hotkey_poller_loop, daemon=True)
+        self.poller_thread.start()
 
         # Заполняем список окон
         self.refresh_windows_list()
@@ -261,94 +230,81 @@ class AutoHoldApp:
         # Обработка закрытия окна
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def is_alt_pressed_now(self):
-        """
-        Многоуровневая проверка зажатия клавиши Alt с защитой от синтетического сброса Windows.
-        Windows при щелчке мыши с Alt часто сбрасывает флаг меню, посылая fake keyup.
-        """
-        now = time.time()
-        # 1. Флаг зажатия от слушателя
-        if self.alt_is_down:
-            return True
-        # 2. Недавнее нажатие/отпускание Alt (окно 400 мс)
-        if (now - self.last_alt_release_time < 0.40) or (now - self.last_alt_press_time < 0.70 and self.last_alt_press_time > 0):
-            return True
-        # 3. Аппаратный опрос драйвера
-        if bool((user32.GetAsyncKeyState(VK_MENU) & 0x8000) or
-                (user32.GetAsyncKeyState(VK_LMENU) & 0x8000) or
-                (user32.GetAsyncKeyState(VK_RMENU) & 0x8000) or
-                (user32.GetKeyState(VK_MENU) & 0x8000)):
-            return True
-        return False
-
-    def on_kb_press(self, key):
-        if is_alt_key_object(key):
-            self.alt_is_down = True
-            self.last_alt_press_time = time.time()
-            # Если пользователь зажал кнопку мыши ДО того, как нажал Alt:
-            if bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
-                self.root.after(0, self.toggle_lmb)
-            elif bool(user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000):
-                self.root.after(0, self.toggle_rmb)
-
-        elif key == pynput_kb.Key.f6:
-            self.root.after(0, self.toggle_lmb)
-        elif key == pynput_kb.Key.f7:
-            self.root.after(0, self.toggle_rmb)
-        elif key == pynput_kb.Key.f8:
-            self.root.after(0, self.stop_all)
-        elif key == pynput_kb.Key.esc:
-            if self.lmb_held or self.rmb_held:
-                self.root.after(0, self.stop_all)
-
-    def on_kb_release(self, key):
-        if is_alt_key_object(key):
-            self.alt_is_down = False
-            self.last_alt_release_time = time.time()
-
-    def on_mouse_click(self, x, y, button, pressed):
-        if not pressed:
-            return
-
-        if self.is_picking:
-            self.is_picking = False
-            self.root.after(0, self.handle_picker_completed)
-            return
-
-        # Проверяем зажатие Alt
-        if self.is_alt_pressed_now():
-            if button == mouse.Button.left:
-                self.root.after(0, self.toggle_lmb)
-            elif button == mouse.Button.right:
-                self.root.after(0, self.toggle_rmb)
-
     def _hotkey_poller_loop(self):
-        """Фоновый поток для гарантированного отслеживания Alt + клик и F8"""
+        """
+        100% надежный Win32 аппаратный трекер хоткеев через GetAsyncKeyState.
+        Работает глобально в любых играх (Minecraft, GLFW), в полноэкранном режиме,
+        без консоли и без сбоев сторонних библиотек.
+        """
         prev_lmb = False
         prev_rmb = False
-        prev_f8 = False
+        prev_alt = False
+        prev_esc = False
+        last_alt_down_time = 0.0
 
-        while self.hotkey_poller_running:
-            # F8 экстренный стоп
-            f8_now = bool(user32.GetAsyncKeyState(VK_F8) & 0x8000)
-            if f8_now and not prev_f8:
-                self.root.after(0, self.stop_all)
-            prev_f8 = f8_now
+        while self.poller_running:
+            try:
+                now = time.time()
 
-            # Проверка Alt + клик на уровне GetAsyncKeyState
-            alt_now = self.is_alt_pressed_now()
-            lmb_now = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
-            rmb_now = bool(user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000)
+                # Проверка зажатия клавиши Alt (Левый Alt, Правый Alt или общий Alt)
+                alt_down = bool(
+                    (user32.GetAsyncKeyState(VK_LMENU) & 0x8000) or
+                    (user32.GetAsyncKeyState(VK_RMENU) & 0x8000) or
+                    (user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+                )
 
-            if alt_now and not self.is_picking:
-                if lmb_now and not prev_lmb:
+                if alt_down:
+                    last_alt_down_time = now
+
+                # Alt активен, если нажат прямо сейчас ИЛИ был отпущен менее 350мс назад
+                # (защита от синтетического сброса меню Windows при клике мыши)
+                alt_active = alt_down or (now - last_alt_down_time < 0.35)
+
+                lmb_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+                rmb_down = bool(user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000)
+                esc_down = bool(user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
+
+                # Экстренная остановка по Esc
+                if esc_down and not prev_esc:
+                    if self.lmb_held or self.rmb_held:
+                        self.root.after(0, self.stop_all)
+                prev_esc = esc_down
+
+                # Режим пипетки (выбор окна кликом)
+                if self.is_picking:
+                    if lmb_down and not prev_lmb:
+                        self.is_picking = False
+                        self.root.after(0, self.handle_picker_completed)
+                    prev_lmb = lmb_down
+                    prev_rmb = rmb_down
+                    prev_alt = alt_down
+                    time.sleep(0.005)
+                    continue
+
+                # 1. Срабатывание: нажатие ЛКМ при активном Alt
+                if (lmb_down and not prev_lmb) and alt_active:
                     self.root.after(0, self.toggle_lmb)
-                if rmb_now and not prev_rmb:
+
+                # 2. Срабатывание: нажатие ПКМ при активном Alt
+                elif (rmb_down and not prev_rmb) and alt_active:
                     self.root.after(0, self.toggle_rmb)
 
-            prev_lmb = lmb_now
-            prev_rmb = rmb_now
-            time.sleep(0.01)
+                # 3. Обратное срабатывание: нажатие Alt, когда ЛКМ уже физически зажата
+                elif (alt_down and not prev_alt) and lmb_down:
+                    self.root.after(0, self.toggle_lmb)
+
+                # 4. Обратное срабатывание: нажатие Alt, когда ПКМ уже физически зажата
+                elif (alt_down and not prev_alt) and rmb_down:
+                    self.root.after(0, self.toggle_rmb)
+
+                prev_lmb = lmb_down
+                prev_rmb = rmb_down
+                prev_alt = alt_down
+
+            except Exception:
+                pass
+
+            time.sleep(0.006)
 
     def setup_styles(self):
         style = ttk.Style()
@@ -385,7 +341,7 @@ class AutoHoldApp:
         title_lbl.pack(anchor="w")
         sub_lbl = ttk.Label(
             header_frame,
-            text="Зажатие ЛКМ / ПКМ с фиксацией на окне (Minecraft, игры, программы)",
+            text="Зажатие ЛКМ / ПКМ с фиксацией на окне (Minecraft OneBlock, игры, программы)",
             style="SubHeader.TLabel"
         )
         sub_lbl.pack(anchor="w")
@@ -454,7 +410,7 @@ class AutoHoldApp:
         self.lbl_timer = ttk.Label(timer_box, text="Время зажатия: 00:00:00", font=("Segoe UI", 9), style="CardSec.TLabel")
         self.lbl_timer.pack(side="left")
         self.lbl_hotkeys_hint = ttk.Label(
-            timer_box, text="Хоткеи: Alt+ЛКМ (или F6) | Alt+ПКМ (или F7) | F8: Стоп",
+            timer_box, text="Хоткеи: Alt+ЛКМ | Alt+ПКМ | Esc: Стоп",
             font=("Segoe UI", 9, "bold"), foreground="#60a5fa", background=self.bg_card
         )
         self.lbl_hotkeys_hint.pack(side="right")
@@ -467,21 +423,21 @@ class AutoHoldApp:
         ctrl_grid.pack(fill="x")
 
         self.btn_toggle_lmb = tk.Button(
-            ctrl_grid, text="▶ Зажать ЛКМ (Alt+ЛКМ / F6)", bg="#059669", fg="white",
+            ctrl_grid, text="▶ Зажать ЛКМ (Alt+ЛКМ)", bg="#059669", fg="white",
             activebackground="#10b981", activeforeground="white", font=("Segoe UI", 9, "bold"),
             relief="flat", pady=6, command=self.toggle_lmb
         )
         self.btn_toggle_lmb.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
         self.btn_toggle_rmb = tk.Button(
-            ctrl_grid, text="▶ Зажать ПКМ (Alt+ПКМ / F7)", bg="#7c3aed", fg="white",
+            ctrl_grid, text="▶ Зажать ПКМ (Alt+ПКМ)", bg="#7c3aed", fg="white",
             activebackground="#8b5cf6", activeforeground="white", font=("Segoe UI", 9, "bold"),
             relief="flat", pady=6, command=self.toggle_rmb
         )
         self.btn_toggle_rmb.pack(side="left", fill="x", expand=True, padx=4)
 
         self.btn_stop_all = tk.Button(
-            ctrl_grid, text="⏹ СТОП ВСЁ (F8)", bg="#dc2626", fg="white",
+            ctrl_grid, text="⏹ СТОП ВСЁ (Esc)", bg="#dc2626", fg="white",
             activebackground="#ef4444", activeforeground="white", font=("Segoe UI", 9, "bold"),
             relief="flat", pady=6, command=self.stop_all
         )
@@ -563,12 +519,12 @@ class AutoHoldApp:
 
         tip_lbl = ttk.Label(
             container,
-            text="💡 Хоткеи: Левый Alt + ЛКМ / ПКМ, а также клавиши F6 (ЛКМ), F7 (ПКМ) и F8 (Стоп).",
+            text="💡 Хоткеи: Левый Alt + ЛКМ (зажать/отпустить ЛКМ), Левый Alt + ПКМ (зажать/отпустить ПКМ), Esc (Стоп).",
             style="SubHeader.TLabel"
         )
         tip_lbl.pack(anchor="w", pady=(2, 0))
 
-        self.log("AutoHold Pro готов. Горячие клавиши: Alt + ЛКМ (или F6), Alt + ПКМ (или F7), F8.")
+        self.log("AutoHold Pro готов. Горячие клавиши: Alt + ЛКМ, Alt + ПКМ, Esc.")
 
     def log(self, text):
         now_str = time.strftime("%H:%M:%S")
@@ -691,38 +647,10 @@ class AutoHoldApp:
         root_hwnd = user32.GetAncestor(hwnd_under, GA_ROOT) or hwnd_under
         self._apply_picked_window(root_hwnd)
 
-    def _apply_picked_window(self, hwnd):
-        self.refresh_windows_list()
-        matched = None
-        for w in self.windows_cache:
-            if w["hwnd"] == hwnd:
-                matched = w
-                break
-
-        if not matched:
-            title = ctypes.create_unicode_buffer(512)
-            user32.GetWindowTextW(hwnd, title, 512)
-            pname = get_process_name_by_hwnd(hwnd)
-            matched = {
-                "hwnd": hwnd,
-                "title": title.value.strip() or "Без названия",
-                "pname": pname,
-                "display": f"[{pname}] {title.value.strip() or 'Без названия'}"
-            }
-            self.windows_cache.insert(0, matched)
-            self.combo_windows["values"] = [w["display"] for w in self.windows_cache]
-
-        self.target_window_data = matched
-        self.combo_windows.set(matched["display"])
-        self.on_window_selected()
-        self.lbl_selected_info.config(foreground=self.text_secondary)
-        self.log(f"Окно зафиксировано: {matched['display']}")
-
     # --- Управление зажатием ---
     def toggle_lmb(self):
-        # Дебаунс 250мс для предотвращения повторного срабатывания
         now = time.time()
-        if now - self.last_lmb_toggle < 0.25:
+        if now - self.last_lmb_toggle < 0.35:
             return
         self.last_lmb_toggle = now
 
@@ -737,7 +665,7 @@ class AutoHoldApp:
 
     def toggle_rmb(self):
         now = time.time()
-        if now - self.last_rmb_toggle < 0.25:
+        if now - self.last_rmb_toggle < 0.35:
             return
         self.last_rmb_toggle = now
 
@@ -761,7 +689,22 @@ class AutoHoldApp:
 
         self.play_sound(on=True)
         self.log(f"🟢 [ХОТКЕЙ] ЗАЖАТА ЛКМ на окне: {self.target_window_data['display']}")
+
+        threading.Thread(target=self._activate_lmb_hold, daemon=True).start()
         self.ensure_worker_running()
+
+    def _activate_lmb_hold(self):
+        """
+        Ключевой фикс: ждем, пока палец пользователя физически отпустит ЛКМ.
+        Только после этого отправляем аппаратный MOUSEEVENTF_LEFTDOWN!
+        Благодаря этому физический MOUSEEVENTF_LEFTUP никогда не собьет зажатие в Minecraft.
+        """
+        while bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000) and self.lmb_held:
+            time.sleep(0.01)
+        time.sleep(0.03)
+
+        if self.lmb_held:
+            self.press_hardware_lmb()
 
     def _stop_lmb(self):
         if not self.lmb_held:
@@ -787,7 +730,17 @@ class AutoHoldApp:
 
         self.play_sound(on=True)
         self.log(f"🟣 [ХОТКЕЙ] ЗАЖАТА ПКМ на окне: {self.target_window_data['display']}")
+
+        threading.Thread(target=self._activate_rmb_hold, daemon=True).start()
         self.ensure_worker_running()
+
+    def _activate_rmb_hold(self):
+        while bool(user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000) and self.rmb_held:
+            time.sleep(0.01)
+        time.sleep(0.03)
+
+        if self.rmb_held:
+            self.press_hardware_rmb()
 
     def _stop_rmb(self):
         if not self.rmb_held:
@@ -816,7 +769,7 @@ class AutoHoldApp:
 
             if was_active:
                 self.play_sound(on=False)
-                self.log("🛑 ВСЕ ЗАЖАТИЯ ОСТАНОВЛЕНЫ (F8)")
+                self.log("🛑 ВСЕ ЗАЖАТИЯ ОСТАНОВЛЕНЫ (Esc)")
         self.update_ui_state()
 
     def release_hardware_lmb(self):
@@ -830,14 +783,12 @@ class AutoHoldApp:
             self.physical_rmb_down = False
 
     def press_hardware_lmb(self):
-        if not self.physical_lmb_down:
-            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            self.physical_lmb_down = True
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        self.physical_lmb_down = True
 
     def press_hardware_rmb(self):
-        if not self.physical_rmb_down:
-            user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-            self.physical_rmb_down = True
+        user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+        self.physical_rmb_down = True
 
     def send_postmessage_up(self, button):
         if not self.target_window_data:
@@ -861,7 +812,7 @@ class AutoHoldApp:
             self.worker_thread.start()
 
     def _worker_loop(self):
-        """Главный цикл зажатия"""
+        """Главный цикл удержания"""
         while self.worker_running:
             with self.lock:
                 l_down = self.lmb_held
@@ -881,13 +832,16 @@ class AutoHoldApp:
             # РЕЖИМ 1: Умная фиксация на окне
             if mode == "smart_lock":
                 if is_target_focused:
-                    # В окне игры: физический зажим мыши
-                    if l_down:
-                        self.press_hardware_lmb()
-                    if r_down:
-                        self.press_hardware_rmb()
+                    # В окне игры: мышь физически зажата
+                    # Если пользователь не кликает физически, гарантируем удержание
+                    if l_down and not (user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
+                        if not self.physical_lmb_down:
+                            self.press_hardware_lmb()
+                    if r_down and not (user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000):
+                        if not self.physical_rmb_down:
+                            self.press_hardware_rmb()
                 else:
-                    # В другом окне: отпускаем мышь для пользователя
+                    # В другом окне (браузер / дискорд): отпускаем мышь для пользователя
                     self.release_hardware_lmb()
                     self.release_hardware_rmb()
 
@@ -905,10 +859,12 @@ class AutoHoldApp:
 
             # РЕЖИМ 2: Прямой постоянный зажим
             elif mode == "direct_hold":
-                if l_down:
-                    self.press_hardware_lmb()
-                if r_down:
-                    self.press_hardware_rmb()
+                if l_down and not (user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
+                    if not self.physical_lmb_down:
+                        self.press_hardware_lmb()
+                if r_down and not (user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000):
+                    if not self.physical_rmb_down:
+                        self.press_hardware_rmb()
                 time.sleep(0.04)
 
             # РЕЖИМ 3: Фоновый PostMessage
@@ -980,19 +936,19 @@ class AutoHoldApp:
                 text="🟢 ЛКМ ЗАЖАТА (Левая кнопка удерживается)", bg="#059669", fg="white"
             )
             self.btn_toggle_lmb.config(text="⏹ Отпустить ЛКМ", bg="#b91c1c")
-            self.btn_toggle_rmb.config(text="▶ Зажать ПКМ (Alt+ПКМ / F7)", bg="#7c3aed")
+            self.btn_toggle_rmb.config(text="▶ Зажать ПКМ (Alt+ПКМ)", bg="#7c3aed")
         elif self.rmb_held:
             self.lbl_status_badge.config(
                 text="🟣 ПКМ ЗАЖАТА (Правая кнопка удерживается)", bg="#7c3aed", fg="white"
             )
-            self.btn_toggle_lmb.config(text="▶ Зажать ЛКМ (Alt+ЛКМ / F6)", bg="#059669")
+            self.btn_toggle_lmb.config(text="▶ Зажать ЛКМ (Alt+ЛКМ)", bg="#059669")
             self.btn_toggle_rmb.config(text="⏹ Отпустить ПКМ", bg="#b91c1c")
         else:
             self.lbl_status_badge.config(
                 text="⏸️ ОЖИДАНИЕ (Кнопки не зажаты)", bg="#374151", fg="#e5e7eb"
             )
-            self.btn_toggle_lmb.config(text="▶ Зажать ЛКМ (Alt+ЛКМ / F6)", bg="#059669")
-            self.btn_toggle_rmb.config(text="▶ Зажать ПКМ (Alt+ПКМ / F7)", bg="#7c3aed")
+            self.btn_toggle_lmb.config(text="▶ Зажать ЛКМ (Alt+ЛКМ)", bg="#059669")
+            self.btn_toggle_rmb.config(text="▶ Зажать ПКМ (Alt+ПКМ)", bg="#7c3aed")
 
     def update_ui_timer(self):
         if self.hold_start_time and (self.lmb_held or self.rmb_held):
@@ -1008,15 +964,7 @@ class AutoHoldApp:
 
     def on_close(self):
         self.stop_all()
-        self.hotkey_poller_running = False
-        try:
-            self.kb_listener.stop()
-        except Exception:
-            pass
-        try:
-            self.mouse_listener.stop()
-        except Exception:
-            pass
+        self.poller_running = False
         self.root.destroy()
 
 
