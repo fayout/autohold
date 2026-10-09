@@ -4,6 +4,7 @@ AutoHold Pro - Надежное зажатие клавиш мыши (Левый
 
 Поддерживает запуск как с консолью, так и без консоли (pythonw / .pyw / .exe).
 100% чистый Win32 API через ctypes (без сторонних хуков pynput), мгновенный отклик и надежность.
+Работает как в активном окне, так и в фоне при Alt+Tab!
 """
 
 import sys
@@ -143,10 +144,11 @@ def get_all_visible_windows():
 
 
 def find_input_target_hwnds(top_hwnd):
-    """Находит фактические HWND для отправки сообщений (включая Canvas в играх)"""
+    """Находит фактические HWND для отправки сообщений (включая верхнее окно и Canvas)"""
     if not top_hwnd or not user32.IsWindow(top_hwnd):
         return []
 
+    hwnds = [top_hwnd]
     children = []
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -157,21 +159,18 @@ def find_input_target_hwnds(top_hwnd):
 
     user32.EnumChildWindows(top_hwnd, WNDENUMPROC(child_cb), 0)
 
-    canvas_hwnds = []
     for ch in children:
         buf = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(ch, buf, 256)
         cls = buf.value.lower()
         if "canvas" in cls or "render" in cls or "gl" in cls:
-            canvas_hwnds.append(ch)
+            hwnds.append(ch)
 
-    if canvas_hwnds:
-        return canvas_hwnds
+    for ch in children:
+        if ch not in hwnds:
+            hwnds.append(ch)
 
-    if children:
-        return [children[0], top_hwnd]
-
-    return [top_hwnd]
+    return list(dict.fromkeys(hwnds))
 
 
 class AutoHoldApp:
@@ -273,11 +272,8 @@ class AutoHoldApp:
                 if alt_down and not tab_down:
                     last_alt_down_time = now
                 elif tab_down:
-                    # При Alt+Tab сбрасываем время альта, чтобы не сработало случайное переключение
                     last_alt_down_time = 0.0
 
-                # Alt активен, если нажат прямо сейчас ИЛИ был отпущен менее 300мс назад
-                # (защита от синтетического сброса меню Windows при клике мыши)
                 alt_active = (alt_down or (now - last_alt_down_time < 0.30)) and not tab_down
 
                 lmb_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
@@ -308,11 +304,9 @@ class AutoHoldApp:
                     continue
 
                 # Срабатывание ТОЛЬКО при физическом клике мыши вместе с Alt!
-                # 1. Нажатие ЛКМ при активном Alt
                 if (lmb_down and not prev_lmb) and alt_active:
                     self.root.after(0, self.toggle_lmb)
 
-                # 2. Нажатие ПКМ при активном Alt
                 elif (rmb_down and not prev_rmb) and alt_active:
                     self.root.after(0, self.toggle_rmb)
 
@@ -472,7 +466,7 @@ class AutoHoldApp:
 
         r1 = ttk.Radiobutton(
             modes_frame,
-            text="Умная фиксация на окне (Рекомендуется: копает в игре, освобождает мышь при Alt+Tab)",
+            text="Умная фиксация (Рекомендуется: держит мышь в игре, продолжает копать в фоне при Alt+Tab)",
             variable=self.var_mode,
             value="smart_lock"
         )
@@ -480,7 +474,7 @@ class AutoHoldApp:
 
         r2 = ttk.Radiobutton(
             modes_frame,
-            text="Прямой постоянный зажим (Direct Hold: удерживает ЛКМ/ПКМ намертво везде)",
+            text="Прямой постоянный зажим (Direct Hold: физически удерживает ЛКМ/ПКМ намертво везде)",
             variable=self.var_mode,
             value="direct_hold"
         )
@@ -488,7 +482,7 @@ class AutoHoldApp:
 
         r3 = ttk.Radiobutton(
             modes_frame,
-            text="Фоновый режим PostMessage (Отправляет Win32 сообщения без захвата физической мыши)",
+            text="Фоновый режим PostMessage (Шлет только оконные сообщения без физической мыши)",
             variable=self.var_mode,
             value="background_postmessage"
         )
@@ -537,12 +531,13 @@ class AutoHoldApp:
 
         tip_lbl = ttk.Label(
             container,
-            text="💡 Хоткеи: Левый Alt + ЛКМ (зажать/отпустить ЛКМ), Левый Alt + ПКМ (зажать/отпустить ПКМ), Esc (Стоп).",
+            text="💡 Хоткеи: Alt+ЛКМ / Alt+ПКМ. В Minecraft нажмите F3+P, чтобы игра не вставала на паузу при Alt+Tab!",
             style="SubHeader.TLabel"
         )
         tip_lbl.pack(anchor="w", pady=(2, 0))
 
         self.log("AutoHold Pro готов. Горячие клавиши: Alt + ЛКМ, Alt + ПКМ, Esc.")
+        self.log("💡 Совет: В Minecraft нажмите F3+P, чтобы отключить автопаузу при переключении окон.")
 
     def log(self, text):
         now_str = time.strftime("%H:%M:%S")
@@ -573,7 +568,7 @@ class AutoHoldApp:
         if not self.target_window_data:
             mc_window = None
             for w in self.windows_cache:
-                if ("oneblock" in w["title"].lower() or "minecraft" in w["title"].lower()) and "antigravity" not in w["pname"].lower():
+                if ("oneblock" in w["title"].lower() or "minecraft" in w["title"].lower() or "mcskill" in w["title"].lower()) and "antigravity" not in w["pname"].lower():
                     mc_window = w
                     break
 
@@ -621,7 +616,7 @@ class AutoHoldApp:
             input_hwnds = find_input_target_hwnds(hwnd)
             target_str = ", ".join([f"{h:#08x}" for h in input_hwnds])
             self.lbl_selected_info.config(
-                text=f"Выбрано: {self.target_window_data['display']} (HWND: {hwnd:#08x}, Цель: {target_str})"
+                text=f"Выбрано: {self.target_window_data['display']} (HWND: {hwnd:#08x}, Цели: {target_str})"
             )
             self.log(f"Выбрано целевое окно: {self.target_window_data['display']}")
 
@@ -680,7 +675,6 @@ class AutoHoldApp:
                 )
                 return
 
-            # Активируем окно игры и запускаем зажатие
             target_hwnd = self.target_window_data["hwnd"]
             self._focus_window(target_hwnd)
             self.root.after(120, self._start_lmb_from_gui)
@@ -763,14 +757,17 @@ class AutoHoldApp:
 
     def _activate_lmb_hold(self):
         """
-        Ждем отпускания физической кнопки пользователем, затем активируем аппаратный зажим.
+        Ждем отпускания физической кнопки пользователем, затем активируем зажим.
         """
         while bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000) and self.lmb_held:
             time.sleep(0.01)
         time.sleep(0.03)
 
         if self.lmb_held:
-            self.press_hardware_lmb()
+            fg_hwnd = user32.GetForegroundWindow()
+            target_hwnd = self.target_window_data["hwnd"] if self.target_window_data else None
+            if fg_hwnd == target_hwnd or (target_hwnd and user32.GetAncestor(fg_hwnd, GA_ROOT) == target_hwnd):
+                self.press_hardware_lmb()
 
     def _stop_lmb(self):
         if not self.lmb_held:
@@ -806,7 +803,10 @@ class AutoHoldApp:
         time.sleep(0.03)
 
         if self.rmb_held:
-            self.press_hardware_rmb()
+            fg_hwnd = user32.GetForegroundWindow()
+            target_hwnd = self.target_window_data["hwnd"] if self.target_window_data else None
+            if fg_hwnd == target_hwnd or (target_hwnd and user32.GetAncestor(fg_hwnd, GA_ROOT) == target_hwnd):
+                self.press_hardware_rmb()
 
     def _stop_rmb(self):
         if not self.rmb_held:
@@ -874,6 +874,7 @@ class AutoHoldApp:
             cy = max(1, (rect.bottom - rect.top) // 2)
             lparam = (cy << 16) | (cx & 0xFFFF)
             user32.PostMessageW(h, msg, 0, lparam)
+            user32.PostMessageW(h, msg, 0, 0)
 
     def ensure_worker_running(self):
         if not self.worker_running:
@@ -902,7 +903,7 @@ class AutoHoldApp:
             # РЕЖИМ 1: Умная фиксация на окне
             if mode == "smart_lock":
                 if is_target_focused:
-                    # В окне игры: мышь физически зажата
+                    # В окне игры: держим физический аппаратный зажим для идеальной работы в 3D
                     if l_down and not self.physical_lmb_down:
                         if not (user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
                             self.press_hardware_lmb()
@@ -910,21 +911,28 @@ class AutoHoldApp:
                         if not (user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000):
                             self.press_hardware_rmb()
                 else:
-                    # В другом окне (браузер / дискорд): отпускаем мышь для пользователя
+                    # В другом окне (браузер / дискорд / YouTube):
+                    # 1. Отпускаем физическую мышь, чтобы вы могли свободно кликать
                     self.release_hardware_lmb()
                     self.release_hardware_rmb()
 
+                    # 2. Непрерывно отправляем WM_LBUTTONDOWN / WM_RBUTTONDOWN в окно игры,
+                    # чтобы игра продолжала копать / строить в фоновом режиме без фокуса!
                     if target_hwnd:
                         hwnds = find_input_target_hwnds(target_hwnd)
-                        wparam = (MK_LBUTTON if l_down else 0) | (MK_RBUTTON if r_down else 0)
                         for h in hwnds:
                             rect = wintypes.RECT()
                             user32.GetClientRect(h, ctypes.byref(rect))
                             cx = max(1, (rect.right - rect.left) // 2)
                             cy = max(1, (rect.bottom - rect.top) // 2)
                             lparam = (cy << 16) | (cx & 0xFFFF)
-                            user32.PostMessageW(h, WM_MOUSEMOVE, wparam, lparam)
-                time.sleep(0.04)
+                            if l_down:
+                                user32.PostMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+                                user32.PostMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, 0)
+                            if r_down:
+                                user32.PostMessageW(h, WM_RBUTTONDOWN, MK_RBUTTON, lparam)
+                                user32.PostMessageW(h, WM_RBUTTONDOWN, MK_RBUTTON, 0)
+                time.sleep(0.06)
 
             # РЕЖИМ 2: Прямой постоянный зажим
             elif mode == "direct_hold":
@@ -950,9 +958,11 @@ class AutoHoldApp:
                         lparam = (cy << 16) | (cx & 0xFFFF)
                         if l_down:
                             user32.PostMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+                            user32.PostMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, 0)
                         if r_down:
                             user32.PostMessageW(h, WM_RBUTTONDOWN, MK_RBUTTON, lparam)
-                time.sleep(0.08)
+                            user32.PostMessageW(h, WM_RBUTTONDOWN, MK_RBUTTON, 0)
+                time.sleep(0.06)
 
             # РЕЖИМ 4: Автокликер
             elif mode == "clicker":
